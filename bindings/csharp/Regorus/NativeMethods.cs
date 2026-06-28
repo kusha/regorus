@@ -256,7 +256,7 @@ namespace Regorus.Internal
         /// Pre-load HostAwait responses for run-to-completion mode.
         /// </summary>
         [DllImport(LibraryName, EntryPoint = "regorus_rvm_set_host_await_responses", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        internal static extern RegorusResult regorus_rvm_set_host_await_responses(RegorusRvm* vm, byte* identifier, byte** values_json, UIntPtr values_len);
+        internal static extern RegorusResult regorus_rvm_set_host_await_responses(RegorusRvm* vm, RegorusHostAwaitResponseSet* response_sets, UIntPtr response_sets_len);
 
         /// <summary>
         /// Get the HostAwait argument as a JSON string.
@@ -1029,7 +1029,17 @@ namespace Regorus.Internal
     internal unsafe partial struct RegorusHostAwaitBuiltin
     {
         public byte* name;
-        public UIntPtr arg_count;
+    }
+
+    /// <summary>
+    /// FFI wrapper for a per-identifier set of pre-loaded HostAwait response values.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal unsafe partial struct RegorusHostAwaitResponseSet
+    {
+        public byte* identifier;
+        public byte** values_json;
+        public UIntPtr values_len;
     }
 
     #endregion
