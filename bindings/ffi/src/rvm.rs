@@ -1076,6 +1076,69 @@ pub struct RegorusHostAwaitResponseSet {
     pub values_len: usize,
 }
 
+/// Validate a caller-supplied array stride before any pointer arithmetic.
+///
+/// `stride` is `sizeof(T)` as the *caller* compiled it. Honoring it as the array
+/// stride is what keeps appended trailing fields forward-compatible, but it is
+/// caller-controlled data, so it has to be checked before it reaches `ptr::add`
+/// or reference formation. Rejects, for a non-empty array:
+///
+/// * a stride that does not cover the fields this build reads (ABI mismatch),
+/// * a stride that is not a multiple of `align_of::<T>()`, which would leave
+///   every element after the first misaligned,
+/// * a misaligned base pointer, which would misalign *every* element even
+///   when the stride itself is well-formed,
+/// * a total span that overflows `usize` or exceeds `isize::MAX`, which is
+///   outside the range `ptr::add` accepts.
+///
+/// The span check subsumes a separate `stride > isize::MAX` test: `len >= 1`
+/// here, so `span >= stride`. It also covers the last element's end, because
+/// `stride >= size_of::<T>()` implies `(len - 1) * stride + size_of::<T>() <= span`.
+fn validate_array_stride<T>(
+    base: *const T,
+    len: usize,
+    stride: usize,
+    size_param: &str,
+    type_name: &str,
+) -> Result<()> {
+    // No array is walked, so the stride is never used as an offset.
+    if len == 0 {
+        return Ok(());
+    }
+
+    let size = core::mem::size_of::<T>();
+    let align = core::mem::align_of::<T>();
+
+    if stride < size {
+        return Err(anyhow!(
+            "{size_param} ({stride}) is smaller than the expected {type_name} layout \
+             ({size} bytes); ABI mismatch"
+        ));
+    }
+    if !stride.is_multiple_of(align) {
+        return Err(anyhow!(
+            "{size_param} ({stride}) is not a multiple of the {type_name} alignment \
+             ({align} bytes); ABI mismatch"
+        ));
+    }
+    if !(base as usize).is_multiple_of(align) {
+        return Err(anyhow!(
+            "{type_name} array pointer is not {align}-byte aligned"
+        ));
+    }
+
+    let span = len.checked_mul(stride).ok_or_else(|| {
+        anyhow!("{type_name} array span overflows (len {len}, {size_param} {stride})")
+    })?;
+    if span > isize::MAX as usize {
+        return Err(anyhow!(
+            "{type_name} array span ({span} bytes) exceeds the maximum addressable range"
+        ));
+    }
+
+    Ok(())
+}
+
 /// Pre-load HostAwait responses for run-to-completion mode.
 ///
 /// Atomically replaces all previously configured responses for **every**
@@ -1105,16 +1168,16 @@ pub extern "C" fn regorus_rvm_set_host_await_responses(
             }
 
             // `response_set_size` is `sizeof(RegorusHostAwaitResponseSet)` as the
-            // caller compiled it, which is also the array stride. Validate and use
-            // it so a caller built against a different struct layout still walks
-            // the array correctly.
-            let min_size = core::mem::size_of::<RegorusHostAwaitResponseSet>();
-            if response_sets_len > 0 && response_set_size < min_size {
-                return Err(anyhow!(
-                    "response_set_size ({response_set_size}) is smaller than the expected \
-                     RegorusHostAwaitResponseSet layout ({min_size} bytes); ABI mismatch"
-                ));
-            }
+            // caller compiled it, which is also the array stride. Validate it
+            // before any pointer arithmetic, then index by it so a caller built
+            // against a different struct layout still walks the array correctly.
+            validate_array_stride(
+                response_sets,
+                response_sets_len,
+                response_set_size,
+                "response_set_size",
+                "RegorusHostAwaitResponseSet",
+            )?;
 
             let mut all = Vec::new();
             all.try_reserve(response_sets_len).map_err(|_| {
@@ -1252,16 +1315,16 @@ pub(crate) fn convert_c_host_await_builtins(
         return Err(anyhow!("null host_await_builtins pointer"));
     }
     // `struct_size` is `sizeof(RegorusHostAwaitBuiltin)` as the caller compiled it,
-    // which is also the array stride. Validate it covers the fields this build
-    // reads, then index by that stride so a caller built against a different
-    // (older/newer) struct layout still walks the array correctly.
-    let min_size = core::mem::size_of::<RegorusHostAwaitBuiltin>();
-    if len > 0 && struct_size < min_size {
-        return Err(anyhow!(
-            "host_await_builtin_size ({struct_size}) is smaller than the expected \
-             RegorusHostAwaitBuiltin layout ({min_size} bytes); ABI mismatch"
-        ));
-    }
+    // which is also the array stride. Validate it before any pointer arithmetic,
+    // then index by it so a caller built against a different (older/newer) struct
+    // layout still walks the array correctly.
+    validate_array_stride(
+        builtins,
+        len,
+        struct_size,
+        "host_await_builtin_size",
+        "RegorusHostAwaitBuiltin",
+    )?;
     let mut result = Vec::new();
     result
         .try_reserve(len)
@@ -1416,5 +1479,208 @@ mod host_await_tests {
             err.to_string().contains("must be a string"),
             "expected a non-string identifier error, got: {err}"
         );
+    }
+
+    // A well-formed array (exact native stride, aligned base) passes for both
+    // caller-facing structs.
+    #[test]
+    fn validate_stride_accepts_native_layout() {
+        let builtins = [RegorusHostAwaitBuiltin {
+            name: core::ptr::null(),
+        }];
+        validate_array_stride(
+            builtins.as_ptr(),
+            builtins.len(),
+            core::mem::size_of::<RegorusHostAwaitBuiltin>(),
+            "host_await_builtin_size",
+            "RegorusHostAwaitBuiltin",
+        )
+        .unwrap();
+
+        let sets = [RegorusHostAwaitResponseSet {
+            identifier: core::ptr::null(),
+            values_json: core::ptr::null(),
+            values_len: 0,
+        }];
+        validate_array_stride(
+            sets.as_ptr(),
+            sets.len(),
+            core::mem::size_of::<RegorusHostAwaitResponseSet>(),
+            "response_set_size",
+            "RegorusHostAwaitResponseSet",
+        )
+        .unwrap();
+    }
+
+    // A larger, still correctly-aligned stride is the forward-compatible
+    // new-caller direction and must keep working.
+    #[test]
+    fn validate_stride_accepts_aligned_oversized() {
+        let wide = [WiderBuiltin {
+            name: core::ptr::null(),
+            _appended: 0,
+        }];
+        validate_array_stride(
+            wide.as_ptr() as *const RegorusHostAwaitBuiltin,
+            wide.len(),
+            core::mem::size_of::<WiderBuiltin>(),
+            "host_await_builtin_size",
+            "RegorusHostAwaitBuiltin",
+        )
+        .unwrap();
+    }
+
+    // A stride below the native layout would read past each element.
+    #[test]
+    fn validate_stride_rejects_undersized() {
+        let sets = [RegorusHostAwaitResponseSet {
+            identifier: core::ptr::null(),
+            values_json: core::ptr::null(),
+            values_len: 0,
+        }];
+        let err = validate_array_stride(
+            sets.as_ptr(),
+            sets.len(),
+            core::mem::size_of::<RegorusHostAwaitResponseSet>() - 1,
+            "response_set_size",
+            "RegorusHostAwaitResponseSet",
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("ABI mismatch"),
+            "expected an ABI mismatch error, got: {err}"
+        );
+    }
+
+    // A stride that clears the size floor but is not a multiple of the alignment
+    // misaligns every element after the first, which is UB at reference formation.
+    #[test]
+    fn validate_stride_rejects_misaligned_stride() {
+        let sets = [RegorusHostAwaitResponseSet {
+            identifier: core::ptr::null(),
+            values_json: core::ptr::null(),
+            values_len: 0,
+        }];
+        let odd = core::mem::size_of::<RegorusHostAwaitResponseSet>() + 1;
+        assert!(!odd.is_multiple_of(core::mem::align_of::<RegorusHostAwaitResponseSet>()));
+
+        let err = validate_array_stride(
+            sets.as_ptr(),
+            2,
+            odd,
+            "response_set_size",
+            "RegorusHostAwaitResponseSet",
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("not a multiple"),
+            "expected a stride-alignment error, got: {err}"
+        );
+    }
+
+    // A misaligned base misaligns every element even when the stride is perfect,
+    // so it must be rejected independently of the stride checks.
+    #[test]
+    fn validate_stride_rejects_misaligned_base() {
+        let buf = [0u8; 64];
+        // SAFETY: only the pointer's address is inspected; it is never dereferenced.
+        let misaligned = unsafe { buf.as_ptr().add(1) } as *const RegorusHostAwaitBuiltin;
+        assert!(
+            !(misaligned as usize).is_multiple_of(core::mem::align_of::<RegorusHostAwaitBuiltin>())
+        );
+
+        let err = validate_array_stride(
+            misaligned,
+            1,
+            core::mem::size_of::<RegorusHostAwaitBuiltin>(),
+            "host_await_builtin_size",
+            "RegorusHostAwaitBuiltin",
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("not 8-byte aligned"),
+            "expected a base-alignment error, got: {err}"
+        );
+    }
+
+    // `len * stride` overflowing `usize` must be caught rather than wrapping into
+    // a small offset. The stride is deliberately alignment-clean and above the
+    // size floor so it reaches the span check rather than an earlier one.
+    #[test]
+    fn validate_stride_rejects_span_overflow() {
+        let sets = [RegorusHostAwaitResponseSet {
+            identifier: core::ptr::null(),
+            values_json: core::ptr::null(),
+            values_len: 0,
+        }];
+        let huge = (isize::MAX as usize) + 1; // 2^63, a multiple of 8
+        assert!(huge.is_multiple_of(core::mem::align_of::<RegorusHostAwaitResponseSet>()));
+
+        let err = validate_array_stride(
+            sets.as_ptr(),
+            4,
+            huge,
+            "response_set_size",
+            "RegorusHostAwaitResponseSet",
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("overflows"),
+            "expected a span-overflow error, got: {err}"
+        );
+    }
+
+    // A span past `isize::MAX` that does *not* overflow `usize` is still outside
+    // the range `ptr::add` accepts. The reviewer's `len = 2` variant of this case
+    // overflows `usize` first and is covered by the test above.
+    #[test]
+    fn validate_stride_rejects_span_past_isize_max() {
+        let sets = [RegorusHostAwaitResponseSet {
+            identifier: core::ptr::null(),
+            values_json: core::ptr::null(),
+            values_len: 0,
+        }];
+        let huge = (isize::MAX as usize) + 1;
+
+        let err = validate_array_stride(
+            sets.as_ptr(),
+            1,
+            huge,
+            "response_set_size",
+            "RegorusHostAwaitResponseSet",
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("exceeds the maximum addressable range"),
+            "expected an addressable-range error, got: {err}"
+        );
+    }
+
+    // A zero-length array walks nothing, so any stride — including bogus ones —
+    // is accepted, matching the no-host-await call path.
+    #[test]
+    fn validate_stride_ignores_size_when_empty() {
+        validate_array_stride(
+            core::ptr::null::<RegorusHostAwaitBuiltin>(),
+            0,
+            0,
+            "host_await_builtin_size",
+            "RegorusHostAwaitBuiltin",
+        )
+        .unwrap();
+        validate_array_stride(
+            core::ptr::null::<RegorusHostAwaitResponseSet>(),
+            0,
+            usize::MAX,
+            "response_set_size",
+            "RegorusHostAwaitResponseSet",
+        )
+        .unwrap();
     }
 }
