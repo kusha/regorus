@@ -24,6 +24,7 @@ use regorus::rvm::program::{
     DeserializationResult, Program,
 };
 use regorus::rvm::vm::{ExecutionMode, ExecutionState, RegoVM, VmError};
+use regorus::utils::limits::check_memory_limit_if_needed;
 use regorus::PolicyModule;
 use regorus::Value;
 
@@ -1221,9 +1222,13 @@ pub extern "C" fn regorus_rvm_set_host_await_responses(
                         anyhow!("invalid JSON at response_sets[{i}].values_json[{j}]: {e}")
                     })?;
                     values.push_back(val);
+                    // Charge caller-driven accumulation against the configured
+                    // memory budget; a no-op unless a limit is set.
+                    check_memory_limit_if_needed()?;
                 }
 
                 all.push((id_value, values));
+                check_memory_limit_if_needed()?;
             }
 
             guard.set_host_await_responses(all);
@@ -1342,6 +1347,7 @@ pub(crate) fn convert_c_host_await_builtins(
         // Arg count is fixed to 1 by the compiler — see the doc comment
         // on `RegorusHostAwaitBuiltin` and `Compiler::register_host_await_builtin`.
         result.push((name, 1));
+        check_memory_limit_if_needed()?;
     }
     Ok(result)
 }
