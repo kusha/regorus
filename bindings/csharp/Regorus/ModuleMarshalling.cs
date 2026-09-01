@@ -295,7 +295,19 @@ namespace Regorus.Internal
 
             var count = responsesByIdentifier.Count;
             var buffer = ArrayPool<RegorusHostAwaitResponseSet>.Shared.Rent(count);
-            var pins = new List<Utf8Marshaller.PinnedUtf8>(count);
+
+            // `pins` takes one entry per identifier plus one per response value.
+            // Sized to `count` alone it would grow mid-loop, and a growth
+            // allocation failing between `Pin` and `Add` would strand a live
+            // GCHandle outside the cleanup list. Size it up front so `Add`
+            // cannot reallocate.
+            var totalValues = 0;
+            foreach (var kvp in responsesByIdentifier)
+            {
+                totalValues += kvp.Value?.Count ?? 0;
+            }
+
+            var pins = new List<Utf8Marshaller.PinnedUtf8>(count + totalValues);
             var innerBuffers = new List<IntPtr[]>(count);
             var innerHandles = new List<GCHandle>(count);
 
