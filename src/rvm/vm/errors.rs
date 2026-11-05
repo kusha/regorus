@@ -11,6 +11,9 @@ use thiserror::Error;
 /// VM execution errors
 #[derive(Error, Debug, Clone, PartialEq)]
 pub enum VmError {
+    #[error("Rule call depth exceeded limit {limit} (pc={pc})")]
+    RuleCallDepthExceeded { limit: usize, pc: usize },
+
     #[error("Execution stopped: exceeded maximum instruction limit of {limit} after {executed} instructions (pc={pc})")]
     InstructionLimitExceeded {
         limit: usize,
@@ -213,6 +216,9 @@ pub enum VmError {
 
     #[error("Assertion failed (pc={pc})")]
     AssertionFailed { pc: usize },
+
+    #[error("eval_conflict_error: evaluation produced conflicting outputs (pc={pc})")]
+    EvaluationConflict { pc: usize },
 
     #[error("Rule-data conflict: {message} (pc={pc})")]
     RuleDataConflict { message: String, pc: usize },

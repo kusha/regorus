@@ -57,9 +57,35 @@ must have been allocated by the current frame.
 | `Not`    | `dest, operand`         | Logical negation.                                             |
 | `AssertCondition` | `condition`    | Fails current loop/rule when the condition is falsey.         |
 | `AssertNotUndefined` | `register`  | Fails when register holds `Value::Undefined`.                 |
+| `CheckConflict` | `left, right` | Raises `VmError::EvaluationConflict` if both values are defined and unequal; does not modify registers. |
 
 `handle_condition` routes through `loops.rs` to propagate failures to loop and
 comprehension contexts. Outside loops it aborts the current rule.
+
+Evaluation conflicts propagate through callers, negation, comprehensions,
+defaults and `else` bodies in both execution modes, regardless of builtin
+strictness. A conflicting answer is an error, not an undefined result that
+negation or a default can turn into a successful answer. Existing arithmetic,
+comparison and unrelated error-handling behavior is unchanged.
+In particular, this does not repair strict builtin errors being absorbed at
+rule boundaries; that is separate from conflict handling.
+
+Rego complete-rule yields use `CheckConflict` before copying a new result.
+Partial-object yields check the previous key value before `ObjectSet`, and
+object comprehensions reject unequal duplicate values while accepting equal
+ones. Generic `Move` and `ObjectSet` still overwrite. `CheckConflict` is appended
+to the serialized instruction enum so existing opcode discriminants stay stable.
+These compiler-emitted checks require recompiling existing Rego artifacts;
+loading an older program does not insert checks into its bytecode. Missing
+candidates are skipped before conflict-bearing accumulator writes, so they
+cannot erase an earlier defined answer. Object comprehensions skip missing keys
+and values locally rather than failing an enclosing loop.
+
+Rego rule yields guard against undefined values (and object keys) before
+updating the accumulator. A missing candidate contributes no answer and cannot
+overwrite an earlier result; `false` and `null` remain valid output values.
+These guards do not change the generic `Move`, `ObjectSet`, or `Index`
+instructions.
 
 ---
 
@@ -128,7 +154,7 @@ both execution modes. In suspendable mode, loops own their own `ExecutionFrame`.
 | Mnemonic             | Operands / Params       | Behaviour                                          |
 | :------------------- | :---------------------- | :------------------------------------------------- |
 | `ComprehensionBegin` | `params_index=pN`       | Allocates collection builder and iteration context. |
-| `ComprehensionYield` | `value_reg`, `key_reg?` | Emits value (and optional key) into builder.        |
+| `ComprehensionYield` | `value_reg`, `key_reg?` | Emits defined values/keys into builder; skips undefined candidates. |
 | `ComprehensionEnd`   | —                       | Finalises collection and stores result.             |
 
 `ComprehensionBeginParams` captures:
@@ -138,6 +164,12 @@ both execution modes. In suspendable mode, loops own their own `ExecutionFrame`.
 - `result_reg`: register that will hold the final collection
 - `key_reg` / `value_reg`: iteration registers
 - `body_start` / `comprehension_end`: branch targets
+
+Skipping an undefined comprehension yield still advances any automatic
+iteration. It does not fail an enclosing loop: for example,
+`p := [x.missing | true] if some x in [{}]` produces `[]`, not undefined.
+This yield-local handling applies in both execution modes and retains `false`
+and `null`.
 
 Comprehensions manage their own stack (`ComprehensionContext`) to maintain
 ordering guarantees (arrays), uniqueness (sets) or key/value pairing (objects).
